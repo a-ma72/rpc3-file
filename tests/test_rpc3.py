@@ -9,7 +9,7 @@ pytest --pyargs rpc3.tests
 import numpy as np
 import pytest
 
-import rpc3_file
+import rpc3_file as rpc3
 
 rng = np.random.default_rng()
 
