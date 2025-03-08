@@ -1,4 +1,4 @@
-RPC3 file class for read/write access.
+A Python RPC3 file class for read/write access to time data acquisition files.
 
 .. |br| raw:: html
 
@@ -92,17 +92,17 @@ position-sensitive, meaning they must appear in specific positions. Subsequent r
 arbitrarily, though certain descriptors should be grouped for faster access. The number of header records
 is not fixed and can be expanded as needed, limited only by available disk space.
 
-.. figure:: docs/rpc3/file_structure.png
+.. figure:: img/file_structure.png
     :align: center
 
     File organisation with header and data section
 
-.. figure:: docs/rpc3/key_values.png
+.. figure:: img/key_values.png
     :align: center
 
     Header consists of key value pairs of fixed size each
 
-.. figure:: docs/rpc3/names.png
+.. figure:: img/names.png
     :align: center
 
     Names are stored in C-style (nul-terminated)
@@ -128,12 +128,12 @@ This summary provides an overview of the RPC III file format, including its orga
 and data management. This format is designed to be flexible and expandable, accommodating various data types
 and storage requirements.
 
-.. figure:: docs/rpc3/multiplex.png
+.. figure:: img/multiplex.png
     :align: center
 
     Channel data is arranged multiplexed
 
-.. figure:: docs/rpc3/multiplex_2.png
+.. figure:: img/multiplex_2.png
     :align: center
 
     This figure shows an example with zero padded final frame
