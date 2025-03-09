@@ -39,6 +39,7 @@ __all__ = [
     "ChannelDict",
     "ChannelList",
     "FileFormatError",
+    "OrderedDict",
     "__author__",
     "__version__",
     "read",
