@@ -65,7 +65,7 @@ def process_readme() -> str | None:
 
 setup(
     name="rpc3-file",
-    version="1.0.0rc3",
+    version="1.0.0rc4",
     license="BSD-2-Clause License",
     description="Read/write access to data files in RPC3 file format.",
     long_description=process_readme(),  # Use README.rst as long description

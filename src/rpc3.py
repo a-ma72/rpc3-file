@@ -32,7 +32,19 @@ if TYPE_CHECKING:
     from collections.abc import Sequence
     from typing import BinaryIO, TypeAlias
 
-    from nptyping import NDArray
+    from numpy.typing import NDArray
+
+__all__ = [
+    "Channel",
+    "ChannelDict",
+    "ChannelList",
+    "FileFormatError",
+    "__author__",
+    "__version__",
+    "read",
+    "to_dict",
+    "write",
+]
 
 
 _INT_FULL_SCALE: int = 2**15 - 16
@@ -40,7 +52,7 @@ _INT16: dtype = dtype("<i2")
 _FLOAT32: dtype = dtype("<f4")
 progressbar: bool = True
 
-__version__ = "1.0.0rc3"
+__version__ = "1.0.0rc4"
 __author__ = "Andreas Martin"
 
 
