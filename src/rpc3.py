@@ -53,7 +53,7 @@ _INT16: dtype = dtype("<i2")
 _FLOAT32: dtype = dtype("<f4")
 progressbar: bool = True
 
-__version__ = "1.0.0rc4"
+__version__ = "1.0.0rc5"
 __author__ = "Andreas Martin"
 
 
@@ -318,10 +318,13 @@ def read(
         if PTS_PER_FRAME <= 0 or PTS_PER_GROUP % PTS_PER_FRAME != 0:
             raise FileFormatError
         FRAMES_PER_GROUP = PTS_PER_GROUP // PTS_PER_FRAME
-        if FRAMES_PER_GROUP <= 0 or FRAMES % FRAMES_PER_GROUP != 0:
+        if FRAMES_PER_GROUP <= 0:
             raise FileFormatError
-        GROUPS = FRAMES // FRAMES_PER_GROUP
-        SAMPLE_PTS = GROUPS * PTS_PER_GROUP
+        if FRAMES % FRAMES_PER_GROUP != 0:
+            msg = "Partially filled last group."
+            warn(msg)
+        GROUPS = (FRAMES + FRAMES_PER_GROUP - 1) // FRAMES_PER_GROUP
+        SAMPLE_PTS = FRAMES * PTS_PER_FRAME
         if params.get("DATA_TYPE", "SHORT_INTEGER") == "SHORT_INTEGER":
             datatype = _INT16
         elif params["DATA_TYPE"] == "FLOATING_POINT":
@@ -346,16 +349,22 @@ def read(
 
         # Read multiplexed channels
         start = 0
-        for _ in tqdm(
-            range(GROUPS),
-            unit="MB",
-            unit_scale=PTS_PER_GROUP * CHANNELS * datatype.itemsize / 1024**2,
-            disable=not progressbar,
-        ):
-            stop = start + PTS_PER_GROUP
-            for ch in range(CHANNELS):
-                channels[ch].data[start:stop] = fromfile(f, datatype, PTS_PER_GROUP)
-            start = stop
+        frames_left = FRAMES
+        frame_size_bytes = PTS_PER_FRAME * CHANNELS * datatype.itemsize
+        with tqdm(
+            total=FRAMES * frame_size_bytes,
+            unit="B",
+            unit_scale=True,
+            unit_divisor=1024,
+            disable=not progressbar) as pbar:
+            for _ in range(GROUPS):
+                frames_to_read = min(frames_left, FRAMES_PER_GROUP)
+                stop = start + frames_to_read * PTS_PER_FRAME
+                for ch in range(CHANNELS):
+                    channels[ch].data[start:stop] = fromfile(f, datatype, stop - start)
+                start = stop
+                frames_left -= frames_to_read
+                pbar.update(frames_to_read * frame_size_bytes)
 
         if SAMPLES is not None:
             for ch in channels:

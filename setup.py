@@ -7,9 +7,10 @@ from setuptools import setup
 
 # Packaging
 # ========================================
-# Clean: python setup.py clean
-# Build: python -mbuild . --sdist --wheel
-# Test:  pytest --pyargs rpc3.tests
+# Clean:    python setup.py clean
+# Build:    python -mbuild . --sdist --wheel
+# Install:  pip install --force-reinstall --no-deps  dist\rpc3_file-1.0.0-py3-none-any.whl
+# Test:     pytest --pyargs rpc3.tests
 
 long_description = (
 """
