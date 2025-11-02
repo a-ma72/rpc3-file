@@ -13,7 +13,7 @@ from collections import OrderedDict, defaultdict
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Callable, Literal, Self, TypeAlias
+from typing import TYPE_CHECKING, Any, Callable, Literal, TypeAlias
 
 from numpy import (
     append,
