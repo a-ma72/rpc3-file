@@ -356,7 +356,7 @@ class BufferedFileReader:
     def __del__(self) -> None:
         self.close()
 
-    def __enter__(self) -> Self:
+    def __enter__(self) -> "BufferedFileReader":
         self.open()
         return self
 
