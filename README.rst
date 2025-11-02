@@ -248,6 +248,6 @@ Documentation generated with the assistance of ChatGPT.
 .. list-table::
 
     * - *Date:*
-      - 2023-04-05
+      - 2025-11-01
     * - *Requires:*
       - Python>=3.7, numpy>=1.19, tqdm

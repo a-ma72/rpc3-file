@@ -6,9 +6,10 @@ pytest --pyargs rpc3.tests
 
 # ruff: noqa: S101 PLR2004 E501
 
+from itertools import product
+
 import numpy as np
 import pytest
-
 import rpc3
 
 rng = np.random.default_rng()
@@ -30,10 +31,30 @@ def test_write() -> None:
     fs = 500
     channels = []
     for _ in range(4):
-        data = np.arange(0, 1, 123456)
+        data = np.arange(0, 123456, 1)
         ch = rpc3.Channel("Accel", "m/s²", dt=1 / fs, data=data)
         channels.append(ch)
     rpc3.write("./test.rpc", channels, overwrite=True)
+
+
+def test_read_strip() -> None:
+    """Write 4 channels."""
+    fs = 500
+    channels = []
+    for _ in range(4):
+        data = np.linspace(0, 1, 57)
+        ch = rpc3.Channel("Accel", "m/s²", dt=1 / fs, data=data)
+        channels.append(ch)
+    rpc3.write(
+        "./test.rpc",
+        channels,
+        overwrite=True,
+        pts_per_group=1024,
+        omit_samples_param=True)
+    read_channels, _ = rpc3.read("./test.rpc", strip=False)
+    assert read_channels[0].data.size == 1024
+    read_channels, _ = rpc3.read("./test.rpc", strip=True)
+    assert read_channels[0].data.size == 57
 
 
 def test_write_ambiguous() -> None:
@@ -83,7 +104,7 @@ def test_non_unique_lengths() -> None:
     fs = 500
     channels = []
     for i in range(4):
-        data = np.arange(0, 1, 123456 - 1000 * i)
+        data = np.arange(0, 123456 - 1000 * i, 1)
         ch = rpc3.Channel("Accel", "m/s²", dt=1 / fs, data=data)
         channels.append(ch)
     rpc3.write("./test.rpc", channels, overwrite=True)
@@ -93,7 +114,7 @@ def test_non_unique_dt() -> None:
     """Test non-unique channel sample rates (should fail)."""
     channels = []
     for i in range(4):
-        data = np.arange(0, 1, 1024)
+        data = np.arange(0, 1024, 1)
         ch = rpc3.Channel(f"Accel_{i}", "m/s²", dt=i, data=data)
         channels.append(ch)
     with pytest.raises(ValueError, match=".*general samplerate"):
@@ -125,14 +146,21 @@ def test_write_reliably_int() -> None:
     channels.append(rpc3.Channel("Random äüöß", "m/s²", dt=1 / fs, data=data))
     data = rng.normal(-33.3, 1000, size=100_000)
     channels.append(rpc3.Channel("Random äüöß", "m/s²", dt=1 / fs, data=data))
-    rpc3.write("./test.rpc", channels, overwrite=True)
-    channels_read, _ = rpc3.read("./test.rpc")
-    for lhs, rhs in zip(channels, channels_read):
-        assert pytest.approx(rhs.minval, rhs.resolution) == rhs.data.min()
-        assert pytest.approx(rhs.maxval, rhs.resolution) == rhs.data.max()
-        assert rhs.name == "Random äüöß"
-        assert np.abs(lhs.data - rhs.data).max() < 2 * rhs.resolution
-        np.testing.assert_allclose(lhs.data, rhs.data, atol=rhs.resolution)
+    rpc3.write(
+        "./test.rpc",
+        channels,
+        overwrite=True)
+    for file_mapping, batch_size in product([True, False], [-1, 0, 1, 2, 128]):
+        channels_read, _ = rpc3.read(
+            "./test.rpc",
+            file_mapping=file_mapping,
+            batch_size=batch_size)
+        for lhs, rhs in zip(channels, channels_read):
+            assert pytest.approx(rhs.minval, rhs.resolution) == rhs.data.min()
+            assert pytest.approx(rhs.maxval, rhs.resolution) == rhs.data.max()
+            assert rhs.name == "Random äüöß"
+            assert np.abs(lhs.data - rhs.data).max() < 2 * rhs.resolution
+            np.testing.assert_allclose(lhs.data, rhs.data, atol=rhs.resolution)
 
 
 def test_write_reliably_float() -> None:
@@ -204,6 +232,100 @@ def test_plot() -> None:
         ax[i].grid()
     plt.tight_layout()
     plt.show()
+
+def _make_channels() -> rpc3.ChannelList:
+    # two voltages (duplicate name), two temps with different units, one current
+    return [
+        rpc3.Channel("voltage", "V", dt=0.1, data=[1, 2, 3]),
+        rpc3.Channel("voltage", "V", dt=0.1, data=[4, 5, 6]),
+        rpc3.Channel("temp_1", "K", dt=0.1, data=[10, 11]),
+        rpc3.Channel("temp_2", "°C", dt=0.1, data=[20, 21]),
+        rpc3.Channel("current", "A", dt=0.1, data=[7, 8, 9]),
+    ]
+
+# ----------------------------- Sequence input ---------------------------------
+
+def test_seq_exact_name_returns_all_matches() -> None:
+    seq = _make_channels()
+    hits = rpc3.find_channel(seq, name="voltage")
+    assert isinstance(hits, list)
+    assert len(hits) == 2
+    assert all(ch.name == "voltage" for ch in hits)
+
+def test_seq_regex_all_name_and_unit():
+    seq = _make_channels()
+    hits = rpc3.find_channel(seq, name=r"temp_\d+", unit=r"K|°C", regex=True, match="all")
+    assert {ch.name for ch in hits} == {"temp_1", "temp_2"}
+
+def test_seq_match_any_with_only_unit():
+    seq = _make_channels()
+    hits = rpc3.find_channel(seq, unit="A", match="any")
+    assert len(hits) == 1 and hits[0].name == "current"
+
+def test_seq_assert_once_zero_one_many():
+    seq = _make_channels()
+    # zero -> None
+    assert rpc3.find_channel(seq, name="power", assert_once=True) is None
+    # one -> Channel
+    one = rpc3.find_channel(seq, name="current", assert_once=True)
+    assert one is not None and one.name == "current"
+    # many -> AssertionError
+    with pytest.raises(AssertionError):
+        rpc3.find_channel(seq, name="voltage", assert_once=True)
+
+def test_seq_as_dict_groups_duplicates_and_keys_by_name():
+    seq = _make_channels()
+    out = rpc3.find_channel(seq, name=r"voltage|current", regex=True, as_dict=True)
+    # dict keyed by name
+    assert "voltage" in out and "current" in out
+    # duplicate name becomes list[Channel]
+    assert isinstance(out["voltage"], list) and len(out["voltage"]) == 2
+    # single stays Channel
+    assert out["current"].name == "current"
+
+# ----------------------------- Mapping input ----------------------------------
+
+def test_map_input_behaves_same_semantics():
+    seq = _make_channels()
+    mapping = rpc3.to_dict(seq)  # produces {'voltage': [.., ..], 'temp_1': Channel, ...}
+    hits = rpc3.find_channel(mapping, unit="V", as_dict=True)
+    assert "voltage" in hits
+    assert isinstance(hits["voltage"], list) and len(hits["voltage"]) == 2
+
+def test_map_assert_once_returns_channel_not_dict():
+    seq = _make_channels()
+    mapping = rpc3.to_dict(seq)
+    ch = rpc3.find_channel(mapping, name="current", assert_once=True)
+    assert isinstance(ch, rpc3.Channel) and ch.name == "current"
+
+def test_map_regex_all_combination():
+    seq = _make_channels()
+    mapping = rpc3.to_dict(seq)
+    hits = rpc3.find_channel(mapping, name=r"temp_\d+", unit=r"K|°C", regex=True, match="all")
+    assert {c.name for c in hits} == {"temp_1", "temp_2"}
+
+# ----------------------------- Stability / edge cases -------------------------
+
+def test_as_dict_with_no_hits_returns_empty_ordered_dict():
+    seq = _make_channels()
+    out = rpc3.find_channel(seq, name="does_not_exist", as_dict=True)
+    # to_dict([]) -> OrderedDict()
+    from collections import OrderedDict
+    assert isinstance(out, OrderedDict) and len(out) == 0
+
+def test_type_errors_for_unsupported_inputs():
+    with pytest.raises(TypeError):
+        rpc3.find_channel("not a container", name="x")  # type: ignore[arg-type]
+
+def test_no_filters_returns_all_for_any_and_all():
+    seq = _make_channels()
+    assert len(rpc3.find_channel(seq)) == len(seq)
+    assert len(rpc3.find_channel(seq, match="all")) == len(seq)
+
+def test_only_unit_with_any_works():
+    seq = _make_channels()
+    hits = rpc3.find_channel(seq, unit="A", match="any")
+    assert [h.name for h in hits] == ["current"]
 
 
 def main() -> int:

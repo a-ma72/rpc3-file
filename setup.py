@@ -66,7 +66,7 @@ def process_readme() -> str | None:
 
 setup(
     name="rpc3-file",
-    version="1.0.0rc5",
+    version="1.0.0rc6",
     license="BSD-2-Clause License",
     description="Read/write access to data files in RPC3 file format.",
     long_description=process_readme(),  # Use README.rst as long description
@@ -74,7 +74,7 @@ setup(
     url="http://github.com/a-ma72/rpc3-file",
     author="Andreas Martin",
     setup_requires=["wheel"],
-    python_requires=">=3.7",
+    python_requires=">=3.10",
     install_requires=["numpy>=1.19", "tqdm"],
     package_dir={"rpc3": "src", "rpc3.img": "img", "rpc3.tests": "tests"},
     include_package_data=True,
