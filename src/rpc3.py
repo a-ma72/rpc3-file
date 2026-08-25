@@ -1,6 +1,6 @@
 """RPC3 file class."""
 
-# ruff: noqa: ANN401 B028 C901 E501 N806 PLR0911 PLR0912 PLR0913 PLR0915 PLR2004 S101
+# ruff: noqa: ANN401, B028, C901, E501, N806, PLR0912, PLR0913, PLR0915, PLR2004
 
 from __future__ import annotations
 
@@ -10,10 +10,10 @@ import os
 import re
 import warnings
 from collections import OrderedDict, defaultdict
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Callable, Literal, TypeAlias
+from typing import TYPE_CHECKING, Any, Literal, TypeAlias
 
 from numpy import (
     append,
@@ -102,7 +102,7 @@ class Channel:
     name: str
     unit: str
     dt: float
-    data: Sequence | None
+    data: Sequence | None = None
     minval: float = nan
     maxval: float = nan
     resolution: float = nan
@@ -112,9 +112,7 @@ class Channel:
     def __post_init__(self) -> None:
         """Ensure `data` is a flat NumPy array (or empty array if None)."""
         if self.data is None:
-            # Use an empty array; dtype can be adjusted to your needs.
-            # (Kept generic here to avoid referencing project-specific constants.)
-            self.data = empty(0)
+            self.data = empty(0, dtype=_FLOAT32)
         else:
             self.data = asarray(self.data).flatten()
 
@@ -193,7 +191,7 @@ def to_dict(
             out[name] = items[0]
         else:
             msg = f"Channel name is ambiguous: `{name}`"
-            warnings.warn(msg)
+            warnings.warn(msg, stacklevel=2)
             out[name] = items
 
     return out
@@ -234,28 +232,33 @@ def find_channel(
         If True, enforce that there is at most one match:
         - Return ``None`` if there are zero matches.
         - Return the single match if there is exactly one match.
-        - Raise ``AssertionError`` if more than one match is found.
+        - Raise ``ValueError`` if more than one match is found.
         This mode short-circuits as soon as a second match is detected.
     as_dict : bool, default False
         If True, return matches as a ``Channel`` or
         ``dict[str, Channel | list[Channel]]`` keyed by ``ch.name``.
         If False, return a ``Channel`` or ``list[Channel]``.
 
+
     Returns
     -------
     dict[str, Channel | list[Channel]] | list[Channel] | Channel | None
 
+
     Raises
     ------
-    AssertionError
+    ValueError
         If `assert_once=True` and more than one match is found.
+        If `match` is not ``"any"`` or ``"all"``.
     TypeError
-        If `channels` is not a mapping or a (non-string) sequence.
+        If `channels` is not a mapping, a (non-string) sequence, or ``None``.
+
 
     Notes
     -----
     - Regex patterns, when enabled, use ``re.fullmatch`` semantics.
     - Dict outputs are always keyed by ``ch.name`` regardless of the input container.
+
 
     Examples
     --------
@@ -272,6 +275,12 @@ def find_channel(
     {'current': Channel(name='current', unit='A')}
 
     """
+    if match not in ("any", "all"):
+        msg = 'match must be "any" or "all".'
+        raise ValueError(msg)
+
+    if channels is None:
+        return None
 
     name_is_set = name is not None
     unit_is_set = unit is not None
@@ -307,7 +316,7 @@ def find_channel(
 
     # Mapping branch: preserve only values; result keys are channel names.
     if isinstance(channels, Mapping):
-        def iter_channels() -> Channel:
+        def iter_channels() -> Iterator[Channel]:
             for v in channels.values():
                 if isinstance(v, Channel):
                     yield v
@@ -316,7 +325,7 @@ def find_channel(
                     yield from v
     # Sequence branch (exclude str/bytes to avoid accidental iteration over characters).
     elif isinstance(channels, Sequence) and not isinstance(channels, (str, bytes)):
-        def iter_channels() -> Channel:
+        def iter_channels() -> Iterator[Channel]:
             yield from channels
     else:
         # Unsupported container type.
@@ -335,7 +344,7 @@ def find_channel(
         except StopIteration:
             return ch1
         msg = "More than one match."
-        raise AssertionError(msg)
+        raise ValueError(msg)
 
     # Gather all matches.
     hits = [ch for ch in iter_channels() if pred(ch)]
@@ -356,7 +365,7 @@ class BufferedFileReader:
     def __del__(self) -> None:
         self.close()
 
-    def __enter__(self) -> "BufferedFileReader":
+    def __enter__(self) -> BufferedFileReader:
         self.open()
         return self
 
@@ -368,11 +377,14 @@ class BufferedFileReader:
             return
         self._f = self._file.open("rb")
         if self._file_mapping:
-            self._m = mmap.mmap(self._f.fileno(), 0, access=mmap.ACCESS_READ)
+            try:
+                self._m = mmap.mmap(self._f.fileno(), 0, access=mmap.ACCESS_READ)
+            except (ValueError, OSError) as ex:
+                self._f.close()
+                self._f = None
+                msg = "Cannot memory-map file."
+                raise FileFormatError(msg) from ex
             self._data = frombuffer(self._m, dtype="u1")
-            if self._data is None:
-                msg = "Memory map not available for file."
-                raise FileFormatError(msg)
 
 
     @property
@@ -393,7 +405,15 @@ class BufferedFileReader:
         return fromfile(self._f, dt, count)
 
     def data_view(self, dt: dtype, offset: int = 0) -> NDArray | None:
-        return self._data[offset:].view(dt) if self._data is not None else None
+        if self._data is None:
+            return None
+        np_dtype = dtype(dt)
+        buf = self._data[offset:]
+        itemsize = int(np_dtype.itemsize)
+        usable = (buf.size // itemsize) * itemsize
+        if usable == 0:
+            return empty(0, dtype=np_dtype)
+        return buf[:usable].view(np_dtype)
 
     def close(self) -> None:
         self._data = None
@@ -470,15 +490,40 @@ class _RPC3Reader:
         *,
         ignore_error: bool = False,
     ) -> int | float | str:
+        """Attempt to cast *value* to ``int`` or ``float``, falling back to ``str``.
+
+        String-valued parameters (``OPERATION``, ``PARENT``, ``DESC``,
+        ``UNITS``) are returned as-is without conversion.
+
+        Parameters
+        ----------
+        key : str or bytes
+            Parameter name; bytes are decoded via latin-1.
+        value : str or bytes
+            Raw parameter value; bytes are decoded via latin-1.
+        ignore_error : bool, optional
+            If ``True``, silently return *value* as a string when numeric
+            conversion fails. If ``False``, the conversion exception
+            propagates. Default is ``False``.
+
+        Returns
+        -------
+        int or float or str
+            The converted or original value.
+
+        """
         key, value = _RPC3Reader.decode_key_value(key, value)
         if key.replace("_", ".").split(".")[0] not in (
             "OPERATION",
             "PARENT",
             "DESC",
-            "UNIT",
+            "UNITS",
         ):
             try:
-                return float(value) if "." in value else int(value)
+                try:
+                    return int(value)
+                except (TypeError, ValueError):
+                    return float(value)
             except Exception as _ex:
                 if not ignore_error:
                     raise
@@ -486,6 +531,21 @@ class _RPC3Reader:
 
     @staticmethod
     def decode_key_value(key: str | bytes, value: Any) -> tuple[str, Any]:
+        """Decode *key* and *value* from bytes to ``str`` (latin-1) if needed.
+
+        Parameters
+        ----------
+        key : str or bytes
+            Header key; decoded if bytes.
+        value : Any
+            Header value; decoded if bytes, otherwise returned unchanged.
+
+        Returns
+        -------
+        tuple[str, Any]
+            The decoded ``(key, value)`` pair.
+
+        """
         if isinstance(key, bytes):
             key = key.decode("latin-1")
         if isinstance(value, bytes):
@@ -493,6 +553,21 @@ class _RPC3Reader:
         return key, value
 
     def check_format(self, key: str, value: Any) -> None:
+        """Validate that the first header entry is a supported ``FORMAT``.
+
+        Parameters
+        ----------
+        key : str or bytes
+            Must be ``"FORMAT"``.
+        value : Any
+            Must be ``"BINARY_IEEE_LITTLE_END"`` or ``"BINARY"``.
+
+        Raises
+        ------
+        FileFormatError
+            If *key* is not ``"FORMAT"`` or *value* is unsupported.
+
+        """
         key, value = self.decode_key_value(key, value)
         if key != "FORMAT":
             msg = "First header key must be `FORMAT`."
@@ -503,6 +578,21 @@ class _RPC3Reader:
             raise FileFormatError(msg)
 
     def check_num_header_blocks(self, key: str, value: Any) -> None:
+        """Validate and store the ``NUM_HEADER_BLOCKS`` header entry.
+
+        Parameters
+        ----------
+        key : str or bytes
+            Must be ``"NUM_HEADER_BLOCKS"``.
+        value : Any
+            Must be convertible to a positive integer ≤ 1024.
+
+        Raises
+        ------
+        FileFormatError
+            If *key* is wrong, *value* is non-numeric, or out of range.
+
+        """
         key, value = self.decode_key_value(key, value)
         # support large header (MTS(R) documentation "RPC3 file formats" specifies only max. 256 blocks)
         if key != "NUM_HEADER_BLOCKS":
@@ -520,6 +610,21 @@ class _RPC3Reader:
         self._header_size = int(value) * 512
 
     def check_num_params(self, key: str, value: Any) -> None:
+        """Validate and store the ``NUM_PARAMS`` header entry.
+
+        Parameters
+        ----------
+        key : str or bytes
+            Must be ``"NUM_PARAMS"``.
+        value : Any
+            Must be an integer in ``(3, NUM_HEADER_BLOCKS * 4]``.
+
+        Raises
+        ------
+        FileFormatError
+            If *key* is wrong, *value* is non-numeric, or out of range.
+
+        """
         key, value = self.decode_key_value(key, value)
         # support large header
         # (MTS(R) documentation "RPC3 file formats" specifies only max. 256 blocks)
@@ -537,6 +642,21 @@ class _RPC3Reader:
         self._num_params = int(value)
 
     def check_params(self) -> None:
+        """Validate all header parameters and populate internal state.
+
+        Verifies mandatory parameters (``FILE_TYPE``, ``TIME_TYPE``,
+        ``DELTA_T``, ``CHANNELS``, ``FRAMES``, ``PTS_PER_GROUP``,
+        ``PTS_PER_FRAME``, ``DATA_TYPE``) and derives computed values such as
+        ``_frames_per_group``, ``_num_groups``, ``_sample_pts``, and
+        ``_frame_size_bytes``.
+
+        Raises
+        ------
+        FileFormatError
+            If any mandatory parameter is missing, invalid, or inconsistent,
+            or if the physical file size is smaller than expected.
+
+        """
         if len(self._params) != self._num_params:
             msg = "Wrong number of parameters in file header."
             raise FileFormatError(msg)
@@ -636,6 +756,16 @@ class _RPC3Reader:
             warnings.warn(msg)
 
     def prepare_channels(self, *, header_only: bool = False) -> None:
+        """Allocate :class:`Channel` objects from the parsed header parameters.
+
+        Parameters
+        ----------
+        header_only : bool, optional
+            If ``True``, channels are created with empty data arrays (size 0).
+            If ``False``, data arrays are pre-allocated to hold
+            ``_sample_pts`` samples. Default is ``False``.
+
+        """
         channels = []
         for i in range(1, self._num_channels + 1):
             ch = Channel(
@@ -651,14 +781,16 @@ class _RPC3Reader:
         self._channels = channels
 
     def read_next_param(self) -> tuple[str, str]:
-        """Return next header parameter at read position.
+        """Return the next header parameter at the current read position.
 
-        Value is type casted to float or int if possible.
+        Values that look like integers or floats are returned as strings here;
+        type conversion is handled by :meth:`param_to_number`.
 
         Returns
         -------
-        tuple[str, Any]
-            Parameter as key/value pair.
+        tuple[str, str]
+            A ``(key, value)`` pair, both decoded from latin-1 and stripped
+            of whitespace and null bytes.
 
         """
         key = self._buffered_io.read(32).decode("latin-1").strip(" \0")
@@ -693,6 +825,9 @@ class _RPC3Reader:
         if head is None:
             msg = "Memory map not available for mapped header read."
             raise FileFormatError(msg)
+        if head.size < 3:
+            msg = "File truncated: header is shorter than 3 parameter records."
+            raise FileFormatError(msg)
 
         self.check_format(head["key"][0], head["value"][0])
         self.check_num_header_blocks(head["key"][1], head["value"][1])
@@ -705,7 +840,7 @@ class _RPC3Reader:
         vals = char.rstrip(vals, b"\x00 ")
         vals = char.decode(vals, **decode)
 
-        params = dict(zip(keys, vals))
+        params = dict(zip(keys, vals, strict=False))
 
         for key, value in params.items():
             self._params[key] = self.param_to_number(key, value, ignore_error=True)
@@ -738,7 +873,7 @@ class _RPC3Reader:
                     .reshape(self._num_channels, -1)
                 )
                 for i in range(self._num_channels):
-                    self._channels[i].data[start : start + pts] = buffer[i, :pts]
+                    self._channels[i].data[start:start + pts] = buffer[i, :pts]
                 start += pts
                 frames_left -= frames_to_read
                 pbar.update(frames_to_read * self._frame_size_bytes)
@@ -749,7 +884,15 @@ class _RPC3Reader:
         if dv is None:
             msg = "Memory map not available for mapped data read."
             raise FileFormatError(msg)
-        data = dv.reshape(-1, self._num_channels, self._pts_per_group)
+        expected = self._num_groups * self._pts_per_channels_group
+        if dv.size < expected:
+            msg = "File truncated: header expects more data than present."
+            raise FileFormatError(msg)
+        data = dv[:expected].reshape(
+            self._num_groups,
+            self._num_channels,
+            self._pts_per_group,
+        )
 
         start = 0
         frames_left = self._num_frames
@@ -774,7 +917,7 @@ class _RPC3Reader:
                     .reshape(self._num_channels, -1)
                 )
                 for i in range(self._num_channels):
-                    self._channels[i].data[start : start + pts] = buffer[i, :pts]
+                    self._channels[i].data[start:start + pts] = buffer[i, :pts]
                 start += pts
                 group_first = group_next
                 frames_left -= frames_to_read
@@ -785,8 +928,12 @@ class _RPC3Reader:
         num_samples = self._sample_pts
         if self._num_samples is not None:
             num_samples = self._num_samples
-        elif strip:
-            # Remove gap from last group
+        elif strip and self._num_frames % self._frames_per_group == 0:
+            # Last-value padding is written into unused frames of the last
+            # group. Those frames are only loaded when FRAMES fills the last
+            # group (this library writes one frame per group). A partial last
+            # group does not copy unused frames, so stripping would remove
+            # real samples that happen to match the last value.
             max_tail = max(0, self._pts_per_group - 1)
             tail = max_tail
             for ch in self._channels:
@@ -808,8 +955,9 @@ class _RPC3Reader:
             if self._dtype == _INT16:
                 # Rescale short int datatype
                 ch.data = (ch.data * ch.resolution).astype(_FLOAT32)
-                ch.minval = float(ch.data.min())
-                ch.maxval = float(ch.data.max())
+                if ch.data.size:
+                    ch.minval = float(ch.data.min())
+                    ch.maxval = float(ch.data.max())
             else:
                 ch.resolution = float(finfo(_FLOAT32).resolution)
 
@@ -872,6 +1020,7 @@ def read(
     file_mapping : bool
         Use file to memory mapping. Default is `False`.
 
+
     Raises
     ------
     FileNotFoundError
@@ -879,10 +1028,13 @@ def read(
     FileFormatError
         If an internal format error occurs.
 
+
     Returns
     -------
-    Union[ChannelList, ChannelDict]
-        A list or dictionary of `Channel` objects.
+    tuple[ChannelList | ChannelDict, ParameterList]
+        A 2-tuple of ``(channels, params)`` where *channels* is a list or
+        dictionary of :class:`Channel` objects and *params* is an ordered
+        dictionary of the raw RPC3 header parameters.
 
     """
     return _RPC3Reader(filepath, file_mapping=file_mapping).read(
@@ -914,7 +1066,7 @@ def write(
     datatype : Union[type, None], optional
         The data type used to write channel data, may be `int` or `float`.
         `int` : Data will be quantized to 16-bit resolution.
-        `float' : Data will be written as 32-bit floating point.
+        `float` : Data will be written as 32-bit floating point.
         The default is `int`.
     pts_per_group : int, optional
         The number of sample points per data group. The default is 2048.
@@ -928,10 +1080,12 @@ def write(
         Don't write `SAMPLES` parameter into file header.
         Default is `False`.
 
+
     Raises
     ------
     FileExistsError
         If the file already exists.
+
 
     Returns
     -------
@@ -996,8 +1150,12 @@ def write(
         params["PARTITIONS"] = 1
 
         for i, ch in enumerate(channels, 1):
-            maxval = ch.data.max()
-            minval = ch.data.min()
+            if ch.data.size:
+                maxval = float(ch.data.max())
+                minval = float(ch.data.min())
+            else:
+                maxval = 0.0
+                minval = 0.0
             if datatype == _INT16:
                 scale = max(abs(minval), abs(maxval)) / _INT_FULL_SCALE
                 params[f"SCALE.CHAN_{i}"] = scale if scale != 0 else 1.0
@@ -1021,7 +1179,7 @@ def write(
 
         return params
 
-    if Path(filepath).suffix.lower() not in [".rpc", ".rpc3", ".rsp"]:
+    if Path(filepath).suffix.lower() not in [".rpc", ".rpc3", ".rsp", ".tim"]:
         filepath += ".rpc"
     if not overwrite and Path(filepath).exists():
         msg = f"File {filepath} already exists."
@@ -1049,8 +1207,8 @@ def write(
             else:
                 key, value = "", ""
             f.write(
-                key.encode("latin-1", "strict").ljust(32, b"\0")
-                + str(value).encode("latin-1", "strict").ljust(96, b"\0"),
+                str(key).encode("latin-1", "strict")[:32].ljust(32, b"\0")
+                + str(value).encode("latin-1", "strict")[:96].ljust(96, b"\0"),
             )
         # Write data
         CHANNELS = params["CHANNELS"]
@@ -1073,9 +1231,10 @@ def write(
                 for i, ch in enumerate(channels):
                     buffer = ch.data[start:stop]  # view
                     if buffer.size < PTS_PER_GROUP:
+                        pad = ch.data[-1] if ch.data.size else 0.0
                         buffer = append(
                             buffer,
-                            ones(PTS_PER_GROUP - buffer.size) * ch.data[-1],
+                            ones(PTS_PER_GROUP - buffer.size) * pad,
                         )
 
                     if datatype == _INT16:

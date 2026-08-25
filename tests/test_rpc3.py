@@ -20,10 +20,13 @@ def test_write_empty() -> None:
     rpc3.write("./test.rpc", channels=[], overwrite=True)
 
 
-def test_overwrite() -> None:
-    """Test overwrite."""
-    with pytest.raises(FileExistsError):
-        rpc3.write("./test.rpc", channels=[], overwrite=False)
+def test_overwrite(tmp_path) -> None:
+    """Refuse to overwrite unless `overwrite=True`."""
+    path = tmp_path / "exists.rpc"
+    rpc3.write(str(path), channels=[], overwrite=True)
+    with pytest.raises(FileExistsError, match="already exists"):
+        rpc3.write(str(path), channels=[], overwrite=False)
+    rpc3.write(str(path), channels=[], overwrite=True)
 
 
 def test_write() -> None:
@@ -174,15 +177,16 @@ def test_write_reliably_float() -> None:
     data = rng.normal(-33.3, 1000, size=100_000)
     channels.append(rpc3.Channel("Random äüöß", "m/s²", dt=1 / fs, data=data))
     rpc3.write("./test.rpc", channels, overwrite=True, datatype=float)
-    channels_read, _ = rpc3.read("./test.rpc")
-    for lhs, rhs in zip(channels, channels_read):
-        rel = rhs.resolution * abs(rhs.minval)
-        assert pytest.approx(rhs.minval, rel) == rhs.data.min()
-        assert pytest.approx(rhs.maxval, rel) == rhs.data.max()
-        assert rhs.name == "Random äüöß"
-        assert rhs.unit == "m/s²"
-        assert np.abs(lhs.data - rhs.data).max() < np.abs(rhs.data).max() * rhs.resolution
-        np.testing.assert_allclose(lhs.data, rhs.data, rtol=rhs.resolution)
+    for file_mapping in (False, True):
+        channels_read, _ = rpc3.read("./test.rpc", file_mapping=file_mapping)
+        for lhs, rhs in zip(channels, channels_read):
+            rel = rhs.resolution * abs(rhs.minval)
+            assert pytest.approx(rhs.minval, rel) == rhs.data.min()
+            assert pytest.approx(rhs.maxval, rel) == rhs.data.max()
+            assert rhs.name == "Random äüöß"
+            assert rhs.unit == "m/s²"
+            assert np.abs(lhs.data - rhs.data).max() < np.abs(rhs.data).max() * rhs.resolution
+            np.testing.assert_allclose(lhs.data, rhs.data, rtol=rhs.resolution)
 
 
 def test_plot() -> None:
@@ -269,8 +273,8 @@ def test_seq_assert_once_zero_one_many():
     # one -> Channel
     one = rpc3.find_channel(seq, name="current", assert_once=True)
     assert one is not None and one.name == "current"
-    # many -> AssertionError
-    with pytest.raises(AssertionError):
+    # many -> ValueError
+    with pytest.raises(ValueError, match="More than one match"):
         rpc3.find_channel(seq, name="voltage", assert_once=True)
 
 def test_seq_as_dict_groups_duplicates_and_keys_by_name():
@@ -317,6 +321,18 @@ def test_type_errors_for_unsupported_inputs():
     with pytest.raises(TypeError):
         rpc3.find_channel("not a container", name="x")  # type: ignore[arg-type]
 
+def test_find_channel_none_returns_none():
+    assert rpc3.find_channel(None) is None
+    assert rpc3.find_channel(None, name="x", as_dict=True) is None
+    assert rpc3.find_channel(None, assert_once=True) is None
+
+def test_find_channel_invalid_match_raises():
+    seq = _make_channels()
+    with pytest.raises(ValueError, match='match must be "any" or "all"'):
+        rpc3.find_channel(seq, name="current", match="AND")  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match='match must be "any" or "all"'):
+        rpc3.find_channel(None, match="ALL")  # type: ignore[arg-type]
+
 def test_no_filters_returns_all_for_any_and_all():
     seq = _make_channels()
     assert len(rpc3.find_channel(seq)) == len(seq)
@@ -326,6 +342,286 @@ def test_only_unit_with_any_works():
     seq = _make_channels()
     hits = rpc3.find_channel(seq, unit="A", match="any")
     assert [h.name for h in hits] == ["current"]
+
+
+def _write_custom_rpc3(
+    path,
+    data: np.ndarray,
+    *,
+    pts_per_frame: int,
+    pts_per_group: int,
+    extra_bytes: bytes = b"",
+    omit_samples: bool = True,
+) -> None:
+    """Write a TIME_HISTORY file with independent frame and group sizes.
+
+    `data` is shape ``(n_samples,)`` or ``(n_channels, n_samples)``.
+    """
+    data = np.atleast_2d(np.asarray(data, dtype=np.float32))
+    n_ch, n_samples = data.shape
+    frames = (n_samples + pts_per_frame - 1) // pts_per_frame
+    frames_per_group = pts_per_group // pts_per_frame
+    groups = (frames + frames_per_group - 1) // frames_per_group
+
+    params: list[tuple[str, object]] = [
+        ("DATA_TYPE", "FLOATING_POINT"),
+        ("FILE_TYPE", "TIME_HISTORY"),
+        ("CHANNELS", n_ch),
+        ("DELTA_T", 0.001),
+        ("PTS_PER_FRAME", pts_per_frame),
+        ("PTS_PER_GROUP", pts_per_group),
+        ("FRAMES", frames),
+    ]
+    if not omit_samples:
+        params.append(("SAMPLES", n_samples))
+    for i in range(1, n_ch + 1):
+        ch = data[i - 1]
+        params.extend(
+            [
+                (f"DESC.CHAN_{i}", f"ch{i}"),
+                (f"UNITS.CHAN_{i}", "U"),
+                (f"SCALE.CHAN_{i}", 1.0),
+                (f"LOWER_LIMIT.CHAN_{i}", float(ch.min()) if ch.size else 0.0),
+                (f"UPPER_LIMIT.CHAN_{i}", float(ch.max()) if ch.size else 0.0),
+            ],
+        )
+
+    n_params = len(params) + 3
+    n_blocks = (n_params + 3) // 4
+    header: list[tuple[str, object]] = [
+        ("FORMAT", "BINARY"),
+        ("NUM_HEADER_BLOCKS", n_blocks),
+        ("NUM_PARAMS", n_params),
+        *params,
+    ]
+
+    with path.open("wb") as f:
+        for i in range(n_blocks * 4):
+            key, value = header[i] if i < n_params else ("", "")
+            f.write(
+                str(key).encode("latin-1").ljust(32, b"\0")
+                + str(value).encode("latin-1").ljust(96, b"\0"),
+            )
+        start = 0
+        for _ in range(groups):
+            stop = start + pts_per_group
+            for i in range(n_ch):
+                buf = data[i, start:stop]
+                if buf.size < pts_per_group:
+                    pad = data[i, -1] if data[i].size else 0.0
+                    buf = np.append(
+                        buf,
+                        np.ones(pts_per_group - buf.size, dtype=np.float32) * pad,
+                    )
+                f.write(np.asarray(buf, dtype=np.float32).tobytes())
+            start = stop
+        if extra_bytes:
+            f.write(extra_bytes)
+
+
+@pytest.mark.parametrize("file_mapping", [False, True])
+def test_strip_does_not_trim_partial_last_group(tmp_path, file_mapping: bool) -> None:
+    """Constant tail must be kept when unused last-group frames were not loaded."""
+    pts_per_frame = 256
+    pts_per_group = 1024
+    n_frames = 10  # 2 leftover frames in the last of 3 groups
+    hold = 400
+    n_samples = n_frames * pts_per_frame
+    data = np.concatenate(
+        [
+            np.arange(n_samples - hold, dtype=np.float32),
+            np.full(hold, 999.0, dtype=np.float32),
+        ],
+    )
+    path = tmp_path / "partial_group.rpc"
+    _write_custom_rpc3(
+        path,
+        data,
+        pts_per_frame=pts_per_frame,
+        pts_per_group=pts_per_group,
+        omit_samples=True,
+    )
+    with pytest.warns(Warning, match="Partially filled last group"):
+        channels, _ = rpc3.read(str(path), strip=True, file_mapping=file_mapping)
+    assert channels[0].data.size == n_samples
+    np.testing.assert_allclose(channels[0].data, data, rtol=channels[0].resolution)
+
+
+@pytest.mark.parametrize("file_mapping", [False, True])
+def test_read_strip_last_group_padding(tmp_path, file_mapping: bool) -> None:
+    """Last-value padding in a complete last group is still stripped."""
+    fs = 500
+    n = 57
+    original = np.linspace(0, 1, n)
+    path = tmp_path / "strip.rpc"
+    rpc3.write(
+        str(path),
+        [rpc3.Channel("Accel", "m/s²", dt=1 / fs, data=original)],
+        overwrite=True,
+        pts_per_group=1024,
+        omit_samples_param=True,
+    )
+    channels, _ = rpc3.read(str(path), strip=True, file_mapping=file_mapping)
+    assert channels[0].data.size == n
+    np.testing.assert_allclose(
+        channels[0].data,
+        original,
+        atol=channels[0].resolution,
+    )
+
+
+@pytest.mark.parametrize("file_mapping", [False, True])
+@pytest.mark.parametrize("extra_len", [1, 3, 127, 128, 129, 4001])
+def test_trailing_extra_bytes_are_ignored(
+    tmp_path,
+    file_mapping: bool,
+    extra_len: int,
+) -> None:
+    """Trailing bytes must not break mapped or buffered reads."""
+    path = tmp_path / "extra.rpc"
+    n = 3000
+    channels = [
+        rpc3.Channel("A", "U", dt=0.002, data=np.linspace(0, 1, n)),
+        rpc3.Channel("B", "U", dt=0.002, data=np.linspace(1, 2, n)),
+    ]
+    rpc3.write(str(path), channels, overwrite=True)
+    ref, _ = rpc3.read(str(path), file_mapping=False)
+    with path.open("ab") as f:
+        f.write(b"\xff" * extra_len)
+    with pytest.warns(Warning, match="extra bytes"):
+        got, _ = rpc3.read(str(path), file_mapping=file_mapping)
+    assert len(got) == len(ref)
+    for lhs, rhs in zip(ref, got):
+        np.testing.assert_allclose(lhs.data, rhs.data, atol=rhs.resolution)
+
+
+def test_channel_data_defaults_to_empty() -> None:
+    ch = rpc3.Channel("A", "U", dt=0.1)
+    assert ch.data.size == 0
+    assert ch.data.dtype == np.float32
+
+
+def test_write_empty_channel(tmp_path) -> None:
+    """A channel with no samples can be written and read back."""
+    path = tmp_path / "empty_ch.rpc"
+    rpc3.write(
+        str(path),
+        [rpc3.Channel("Empty", "U", dt=0.1, data=None)],
+        overwrite=True,
+    )
+    channels, params = rpc3.read(str(path))
+    assert params["CHANNELS"] == 1
+    assert channels[0].data.size == 0
+
+
+def test_write_mixed_empty_channel_is_zero_padded(tmp_path) -> None:
+    """Empty channels are padded to the longest channel with zeros."""
+    path = tmp_path / "mixed.rpc"
+    filled = np.array([1.0, 2.0, 3.0, 4.0])
+    rpc3.write(
+        str(path),
+        [
+            rpc3.Channel("Filled", "U", dt=0.1, data=filled),
+            rpc3.Channel("Empty", "U", dt=0.1),
+        ],
+        overwrite=True,
+        datatype=float,
+    )
+    channels, _ = rpc3.read(str(path))
+    np.testing.assert_allclose(channels[0].data, filled, rtol=channels[0].resolution)
+    assert channels[1].data.size == filled.size
+    np.testing.assert_allclose(channels[1].data, 0.0, atol=channels[1].resolution)
+
+
+def test_header_records_are_clipped(tmp_path) -> None:
+    """Keys stay at 32 bytes and values at 96 so the header grid is preserved."""
+    path = tmp_path / "clip.rpc"
+    name = "N" * 120
+    unit = "U" * 120
+    extra_key = "K" * 40
+    extra_val = "V" * 200
+    rpc3.write(
+        str(path),
+        [rpc3.Channel(name, unit, dt=0.1, data=[1.0, 2.0, 3.0])],
+        overwrite=True,
+        extra_params={extra_key: extra_val},
+    )
+    channels, params = rpc3.read(str(path))
+    assert channels[0].name == name[:96]
+    assert channels[0].unit == unit[:96]
+    assert extra_key[:32] in params
+    assert extra_key not in params
+    assert params[extra_key[:32]] == extra_val[:96]
+
+
+@pytest.mark.parametrize("suffix", [".tim", ".rpc", ".rpc3", ".rsp", ".TIM"])
+def test_write_keeps_known_suffixes(tmp_path, suffix: str) -> None:
+    path = tmp_path / f"run{suffix}"
+    rpc3.write(
+        str(path),
+        [rpc3.Channel("A", "U", dt=0.1, data=[1.0])],
+        overwrite=True,
+    )
+    assert path.exists()
+    assert not path.with_name(path.name + ".rpc").exists()
+
+
+def test_write_appends_rpc_for_unknown_suffix(tmp_path) -> None:
+    path = tmp_path / "run.txt"
+    rpc3.write(
+        str(path),
+        [rpc3.Channel("A", "U", dt=0.1, data=[1.0])],
+        overwrite=True,
+    )
+    assert not path.exists()
+    assert path.with_name("run.txt.rpc").exists()
+
+
+def test_scientific_notation_header_values(tmp_path) -> None:
+    """Header numbers such as ``1e-3`` parse as floats, not leftover strings."""
+    path = tmp_path / "sci.rpc"
+    rpc3.write(
+        str(path),
+        [rpc3.Channel("A", "U", dt=0.001, data=[1.0, 2.0])],
+        overwrite=True,
+        extra_params={"MY_SCI": "1e-3", "DELTA_T": "2.5e-4"},
+    )
+    _, params = rpc3.read(str(path))
+    assert params["MY_SCI"] == pytest.approx(1e-3)
+    assert isinstance(params["MY_SCI"], float)
+    assert params["DELTA_T"] == pytest.approx(2.5e-4)
+    assert isinstance(params["DELTA_T"], float)
+
+
+@pytest.mark.parametrize("unit", ["1", "1e-3"])
+def test_numeric_looking_unit_stays_string(tmp_path, unit: str) -> None:
+    """UNITS.CHAN_n must not be parsed as int/float."""
+    path = tmp_path / "unit.rpc"
+    rpc3.write(
+        str(path),
+        [rpc3.Channel("A", unit, dt=0.1, data=[1.0, 2.0])],
+        overwrite=True,
+    )
+    channels, params = rpc3.read(str(path))
+    assert channels[0].unit == unit
+    assert isinstance(channels[0].unit, str)
+    assert params["UNITS.CHAN_1"] == unit
+    assert isinstance(params["UNITS.CHAN_1"], str)
+
+
+def test_header_only_skips_channel_data(tmp_path) -> None:
+    path = tmp_path / "header.rpc"
+    data = np.arange(128, dtype=np.float32)
+    rpc3.write(
+        str(path),
+        [rpc3.Channel("Accel", "m/s²", dt=0.002, data=data)],
+        overwrite=True,
+    )
+    channels, params = rpc3.read(str(path), header_only=True)
+    assert channels[0].data.size == 0
+    assert channels[0].name == "Accel"
+    assert channels[0].unit == "m/s²"
+    assert params["CHANNELS"] == 1
 
 
 def main() -> int:
