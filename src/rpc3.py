@@ -211,9 +211,10 @@ def find_channel(
 
     Parameters
     ----------
-    channels : Sequence[Channel] | Mapping[str, Channel] | None
-        Container of channels. For mappings, values are channels and keys are ignored
-        in the result. For sequences, elements are channels.
+    channels : Sequence[Channel] | Mapping[str, Channel | list[Channel]] | None
+        Container of channels. For mappings, values may be a single `Channel` or a
+        ``list[Channel]`` (as produced by `to_dict`); keys are ignored when matching.
+        For sequences, elements are channels.
     name : str | None, optional
         Name pattern to match against `ch.name`. If `None`, the name criterion is
         ignored. When `regex=True`, interpreted as a regular expression and matched
@@ -231,13 +232,15 @@ def find_channel(
     assert_once : bool, default False
         If True, enforce that there is at most one match:
         - Return ``None`` if there are zero matches.
-        - Return the single match if there is exactly one match.
+        - Return the single match if there is exactly one match
+          (as ``Channel``, or as a one-entry dict when `as_dict=True`).
         - Raise ``ValueError`` if more than one match is found.
         This mode short-circuits as soon as a second match is detected.
     as_dict : bool, default False
-        If True, return matches as a ``Channel`` or
-        ``dict[str, Channel | list[Channel]]`` keyed by ``ch.name``.
-        If False, return a ``Channel`` or ``list[Channel]``.
+        If True, return matches as a ``dict[str, Channel | list[Channel]]``
+        keyed by ``ch.name``. If False, return a ``list[Channel]``.
+        When `assert_once=True` and there is exactly one match, return a
+        one-entry dict if `as_dict=True`, otherwise the bare ``Channel``.
 
 
     Returns
@@ -252,12 +255,16 @@ def find_channel(
         If `match` is not ``"any"`` or ``"all"``.
     TypeError
         If `channels` is not a mapping, a (non-string) sequence, or ``None``.
+    re.error
+        If `regex=True` and `name` or `unit` is not a valid regular expression.
 
 
     Notes
     -----
     - Regex patterns, when enabled, use ``re.fullmatch`` semantics.
     - Dict outputs are always keyed by ``ch.name`` regardless of the input container.
+    - `as_dict` is applied independently of `assert_once` (except zero matches
+      still return ``None`` under `assert_once`).
 
 
     Examples
@@ -270,8 +277,12 @@ def find_channel(
     >>> find_channel(seq, name=r"temp_\\d+", unit=r"K|°C", regex=True, match="all", assert_once=True)
     Channel(name='temp_1', unit='K')
 
-    >>> # Mapping input, OR condition, dict result keyed by channel name
-    >>> find_channel(mapping, name="current", unit="A")
+    >>> # Sequence input, OR on both criteria (default match="any")
+    >>> find_channel(seq, name="voltage", unit="A")
+    [Channel(name='voltage', unit='V'), ..., Channel(name='current', unit='A')]
+
+    >>> # Mapping input, dict result keyed by channel name
+    >>> find_channel(mapping, name="current", as_dict=True)
     {'current': Channel(name='current', unit='A')}
 
     """
@@ -342,7 +353,7 @@ def find_channel(
         try:
             next(it)  # If this succeeds, there is a second match.
         except StopIteration:
-            return ch1
+            return to_dict([ch1]) if as_dict else ch1
         msg = "More than one match."
         raise ValueError(msg)
 

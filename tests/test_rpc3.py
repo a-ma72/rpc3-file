@@ -7,6 +7,7 @@ pytest --pyargs rpc3.tests
 # ruff: noqa: S101 PLR2004 E501
 
 from itertools import product
+import re
 
 import numpy as np
 import pytest
@@ -302,6 +303,18 @@ def test_map_assert_once_returns_channel_not_dict():
     ch = rpc3.find_channel(mapping, name="current", assert_once=True)
     assert isinstance(ch, rpc3.Channel) and ch.name == "current"
 
+def test_assert_once_with_as_dict_returns_one_entry_dict():
+    seq = _make_channels()
+    out = rpc3.find_channel(seq, name="current", assert_once=True, as_dict=True)
+    assert isinstance(out, rpc3.OrderedDict)
+    assert list(out.keys()) == ["current"]
+    assert isinstance(out["current"], rpc3.Channel) and out["current"].name == "current"
+    # zero matches still None (assert_once semantics), even with as_dict
+    assert rpc3.find_channel(seq, name="power", assert_once=True, as_dict=True) is None
+    # many matches still raise
+    with pytest.raises(ValueError, match="More than one match"):
+        rpc3.find_channel(seq, name="voltage", assert_once=True, as_dict=True)
+
 def test_map_regex_all_combination():
     seq = _make_channels()
     mapping = rpc3.to_dict(seq)
@@ -342,6 +355,19 @@ def test_only_unit_with_any_works():
     seq = _make_channels()
     hits = rpc3.find_channel(seq, unit="A", match="any")
     assert [h.name for h in hits] == ["current"]
+
+def test_match_any_with_both_name_and_unit_is_or():
+    seq = _make_channels()
+    hits = rpc3.find_channel(seq, name="voltage", unit="A", match="any")
+    assert {h.name for h in hits} == {"voltage", "current"}
+    # Contrast: AND requires both criteria on the same channel
+    hits_all = rpc3.find_channel(seq, name="voltage", unit="A", match="all")
+    assert hits_all == []
+
+def test_invalid_regex_raises_re_error():
+    seq = _make_channels()
+    with pytest.raises(re.error):
+        rpc3.find_channel(seq, name="[unterminated", regex=True)
 
 
 def _write_custom_rpc3(
